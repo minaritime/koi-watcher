@@ -1,0 +1,41 @@
+name: KOI Notice Watcher
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # 매시 정각 (UTC, 5~15분 지연 가능)
+  workflow_dispatch:        # Actions 탭에서 수동 실행 버튼
+
+permissions:
+  contents: write           # seen.json 을 다시 커밋하기 위해 필요
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run KOI watcher
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python koi_watcher.py
+
+      - name: Commit updated seen.json
+        run: |
+          if git diff --quiet seen.json 2>/dev/null; then
+            echo "변경 없음 — 커밋 스킵"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add seen.json
+            git commit -m "chore: update seen.json"
+            git push
+          fi

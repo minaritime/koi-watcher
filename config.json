@@ -1,0 +1,6 @@
+{
+  "koi_notice_url": "https://koi.or.kr/notice",
+  "koi_base_url": "https://koi.or.kr",
+  "webhook_username": "KOI 공지 알리미",
+  "request_timeout_seconds": 15
+}
