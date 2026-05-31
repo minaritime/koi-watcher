@@ -1,0 +1,41 @@
+name: Limbus Notice Watcher
+
+on:
+  schedule:
+    - cron: '15 * * * *'   # 매시 15분 (KOI 워크플로우와 시간 분산)
+  workflow_dispatch:        # Actions 탭에서 수동 실행 버튼
+
+permissions:
+  contents: write           # limbus_seen.json 을 다시 커밋하기 위해 필요
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Limbus watcher
+        env:
+          LIMBUS_WEBHOOK_URL: ${{ secrets.LIMBUS_WEBHOOK_URL }}
+        run: python limbus_watcher.py
+
+      - name: Commit updated limbus_seen.json
+        run: |
+          if git diff --quiet limbus_seen.json 2>/dev/null; then
+            echo "변경 없음 — 커밋 스킵"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add limbus_seen.json
+            git commit -m "chore: update limbus_seen.json"
+            git push
+          fi

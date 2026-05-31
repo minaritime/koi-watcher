@@ -1,0 +1,8 @@
+{
+  "appid": 1973530,
+  "news_count": 20,
+  "feed_filter": "steam_community_announcements",
+  "store_view_url": "https://store.steampowered.com/news/app/1973530/view/",
+  "webhook_username": "림버스 공지 알리미",
+  "request_timeout_seconds": 15
+}
