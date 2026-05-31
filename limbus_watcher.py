@@ -179,18 +179,53 @@ def parse_notices(data: dict, config: dict) -> list[dict]:
 
 CONTENT_HEADER = "@everyone 📢 림버스 컴퍼니 새 공지가 올라왔습니다"
 EMBED_COLOR = 0xC0392B
-MAX_IMAGES = 4          # 디스코드에 한 번에 보여줄 이미지 최대 개수
-MAX_TEXT_LEN = 600      # 텍스트 공지 본문 발췌 길이
+MAX_IMAGES = 4                       # 한 메시지에 보여줄 이미지 최대 개수
+MAX_TEXT_LEN = 600                   # 텍스트 공지 본문 발췌 길이
+PER_FILE_CAP = 24 * 1024 * 1024      # 첨부 1개 최대 용량 (초과 시 해당 이미지 스킵)
+TOTAL_UPLOAD_CAP = 24 * 1024 * 1024  # 한 메시지 첨부 총합 최대 용량
+_UA = {"User-Agent": "Mozilla/5.0 (Limbus-Watcher)"}
+
+
+def meta_embed(notice: dict) -> dict:
+    """제목·게시일·링크를 담은 임베드 (이미지 없는 카드)."""
+    return {
+        "title": notice["title"],
+        "url": notice["url"],
+        "color": EMBED_COLOR,
+        "fields": [{"name": "게시일", "value": notice["date"], "inline": True}],
+        "footer": {"text": "Limbus Company · Steam 공지"},
+    }
+
+
+def download_images(urls: list[str]) -> list[tuple]:
+    """이미지를 내려받아 (파일명, bytes, mime) 목록으로 반환 (용량 한도 적용)."""
+    files: list[tuple] = []
+    total = 0
+    for i, u in enumerate(urls[:MAX_IMAGES]):
+        try:
+            r = requests.get(u, headers=_UA, timeout=30)
+            r.raise_for_status()
+            data = r.content
+        except Exception:
+            continue
+        if len(data) > PER_FILE_CAP or total + len(data) > TOTAL_UPLOAD_CAP:
+            continue
+        total += len(data)
+        ext = u.split("?")[0].rsplit(".", 1)[-1].lower()
+        if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
+            ext = "png"
+        mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+        files.append((f"limbus_{i}.{ext}", data, mime))
+    return files
 
 
 def build_payload(username: str, notice: dict) -> dict:
-    """이미지>영상>텍스트 우선순위로 디스코드 페이로드를 만든다.
+    """JSON 전용 페이로드 (영상/텍스트, 그리고 이미지 첨부 실패 시 임베드 URL 폴백).
 
-    - 이미지 있음: 이미지를 임베드로 표시 (여러 장이면 갤러리로 묶음)
-    - 영상 있음: 유튜브 URL 을 content 에 넣어 디스코드 재생 카드로 표시
-    - 둘 다 없음: 제목 + 본문 발췌 텍스트
+    - 이미지: 이미지 URL 을 임베드로 표시 (여러 장은 같은 url 공유로 갤러리). 첨부 실패 폴백용.
+    - 영상: 유튜브 URL 을 content 에 넣어 디스코드 재생 카드로 표시
+    - 텍스트: 제목 + 본문 발췌
     """
-    title, date, link = notice["title"], notice["date"], notice["url"]
     images = notice.get("images") or []
     video = notice.get("video")
     base = {"username": username, "allowed_mentions": {"parse": ["everyone"]}}
@@ -198,42 +233,54 @@ def build_payload(username: str, notice: dict) -> dict:
     if images:
         embeds = []
         for i, img in enumerate(images[:MAX_IMAGES]):
-            # 같은 url 을 공유하는 임베드들은 디스코드가 한 카드의 갤러리로 묶어 보여준다.
-            embed = {"url": link, "image": {"url": img}, "color": EMBED_COLOR}
+            embed = {"url": notice["url"], "image": {"url": img}, "color": EMBED_COLOR}
             if i == 0:
-                embed["title"] = title
-                embed["fields"] = [{"name": "게시일", "value": date, "inline": True}]
-                embed["footer"] = {"text": "Limbus Company · Steam 공지"}
+                embed.update(meta_embed(notice))
             embeds.append(embed)
         return {**base, "content": CONTENT_HEADER, "embeds": embeds}
 
     if video:
-        # 유튜브 URL 을 content 에 그대로 두면 디스코드가 재생 가능한 카드로 자동 임베드한다.
         return {
             **base,
-            "content": f"{CONTENT_HEADER}\n**{title}**  (게시일 {date})\n{video}",
+            "content": f"{CONTENT_HEADER}\n**{notice['title']}**  "
+                       f"(게시일 {notice['date']})\n{notice['video']}",
         }
 
-    # 텍스트만 있는 공지
     text = notice.get("text") or ""
     desc = text[:MAX_TEXT_LEN] + ("…" if len(text) > MAX_TEXT_LEN else "")
-    return {
-        **base,
-        "content": CONTENT_HEADER,
-        "embeds": [{
-            "title": title,
-            "url": link,
-            "color": EMBED_COLOR,
-            "description": desc or "(본문 없음)",
-            "fields": [{"name": "게시일", "value": date, "inline": True}],
-            "footer": {"text": "Limbus Company · Steam 공지"},
-        }],
-    }
+    embed = meta_embed(notice)
+    embed["description"] = desc or "(본문 없음)"
+    return {**base, "content": CONTENT_HEADER, "embeds": [embed]}
 
 
 def send_discord(webhook_url: str, username: str, notice: dict) -> None:
-    payload = build_payload(username, notice)
-    resp = requests.post(webhook_url, json=payload, timeout=15)
+    log = logging.getLogger("limbus_watcher")
+
+    if notice.get("images"):
+        # 원본 이미지를 파일로 첨부해야 확대 시 글자가 선명하다.
+        # (임베드 URL 방식은 디스코드 프록시가 압축·축소해서 흐릿함)
+        files = download_images(notice["images"])
+        if files:
+            payload = {
+                "username": username,
+                "allowed_mentions": {"parse": ["everyone"]},
+                "content": CONTENT_HEADER,
+                "embeds": [meta_embed(notice)],
+            }
+            try:
+                resp = requests.post(
+                    webhook_url,
+                    data={"payload_json": json.dumps(payload)},
+                    files={f"file{i}": f for i, f in enumerate(files)},
+                    timeout=90,
+                )
+                resp.raise_for_status()
+                return
+            except Exception as e:
+                log.warning("이미지 첨부 실패 → 임베드 URL 로 폴백: %s", e)
+
+    # 영상·텍스트, 또는 이미지 첨부 실패 시 폴백
+    resp = requests.post(webhook_url, json=build_payload(username, notice), timeout=30)
     resp.raise_for_status()
 
 
