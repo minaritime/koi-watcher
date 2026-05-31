@@ -98,7 +98,6 @@ def parse_notices(data: dict, config: dict) -> list[dict]:
     """API 응답을 파싱. feed_filter 가 설정되면 해당 피드(공식 공지)만 남긴다."""
     items = data.get("appnews", {}).get("newsitems", [])
     feed_filter = config.get("feed_filter")
-    view_base = config.get("store_view_url", "")
 
     notices: list[dict] = []
     for it in items:
@@ -108,8 +107,9 @@ def parse_notices(data: dict, config: dict) -> list[dict]:
         title = (it.get("title") or "").strip()
         if not gid or not title:
             continue
-        # gid 로 스팀 뉴스 보기 링크를 만들고, 실패 시 API 가 준 url 로 폴백
-        url = (view_base + gid) if view_base else (it.get("url") or "")
+        # API 가 주는 url 은 실제 공지 페이지로 정상 리다이렉트된다.
+        # (gid 로 store view URL 을 만들면 ID 체계가 달라 "Event does not exist" 발생)
+        url = (it.get("url") or "").strip()
         date_str = datetime.fromtimestamp(
             it.get("date", 0), tz=timezone.utc
         ).strftime("%Y-%m-%d")
