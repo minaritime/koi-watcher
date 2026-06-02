@@ -179,9 +179,9 @@ def parse_notices(data: dict, config: dict) -> list[dict]:
 
 CONTENT_HEADER = "@everyone 📢 림버스 컴퍼니 새 공지가 올라왔습니다"
 EMBED_COLOR = 0xC0392B
-MAX_IMAGES = 4                       # 한 메시지에 보여줄 이미지 최대 개수
+MAX_IMAGES = 10                      # 한 메시지에 보여줄 이미지 최대 개수 (디스코드 첨부 한도 = 10)
 MAX_TEXT_LEN = 600                   # 텍스트 공지 본문 발췌 길이
-PER_FILE_CAP = 24 * 1024 * 1024      # 첨부 1개 최대 용량 (초과 시 해당 이미지 스킵)
+PER_FILE_CAP = 24 * 1024 * 1024      # 첨부 1개 최대 용량
 TOTAL_UPLOAD_CAP = 24 * 1024 * 1024  # 한 메시지 첨부 총합 최대 용량
 _UA = {"User-Agent": "Mozilla/5.0 (Limbus-Watcher)"}
 
@@ -198,7 +198,12 @@ def meta_embed(notice: dict) -> dict:
 
 
 def download_images(urls: list[str]) -> list[tuple]:
-    """이미지를 내려받아 (파일명, bytes, mime) 목록으로 반환 (용량 한도 적용)."""
+    """이미지를 내려받아 (파일명, bytes, mime) 목록으로 반환.
+
+    이미지를 "전부" 보여주는 것이 목표라, 한 장이라도 못 받거나 용량 한도를 넘으면
+    일부만 첨부해 누락시키지 않고 빈 목록을 반환한다. 그러면 send_discord 가
+    URL 임베드 방식으로 폴백해 (용량 제한 없이) 모든 이미지를 표시한다.
+    """
     files: list[tuple] = []
     total = 0
     for i, u in enumerate(urls[:MAX_IMAGES]):
@@ -207,9 +212,9 @@ def download_images(urls: list[str]) -> list[tuple]:
             r.raise_for_status()
             data = r.content
         except Exception:
-            continue
+            return []  # 일부 실패 → 첨부 포기, URL 임베드로 전부 표시
         if len(data) > PER_FILE_CAP or total + len(data) > TOTAL_UPLOAD_CAP:
-            continue
+            return []  # 용량 초과 → 첨부 포기, URL 임베드로 전부 표시
         total += len(data)
         ext = u.split("?")[0].rsplit(".", 1)[-1].lower()
         if ext not in ("jpg", "jpeg", "png", "gif", "webp"):

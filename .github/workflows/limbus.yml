@@ -2,10 +2,11 @@ name: Limbus Notice Watcher
 
 on:
   schedule:
-    # 한국시간(KST=UTC+9) 평일 저녁 18:00~24:00(자정) 에 15분 간격 확인.
-    # 저녁 6시(KST) = 09:00(UTC), 자정(KST) = 15:00(UTC). 저녁 창은 UTC 같은 날이라 요일(1-5)이 그대로 평일.
-    - cron: '*/15 9-14 * * 1-5'   # 18:00~23:45 KST, 15분 간격
-    - cron: '0 15 * * 1-5'         # 24:00(자정) KST 마지막 1회
+    # 매일 종일 10분 간격. 공지가 언제(요일/시간 무관) 올라와도 최대 ~10분 내 확인.
+    # GitHub 예약 실행은 best-effort 라 정각 부근 등에서 지연·드롭될 수 있는데,
+    # 한 슬롯이 드롭돼도 10분 뒤 다음 슬롯이 받아주고 limbus_seen.json 이 중복을 막아준다.
+    # public 저장소라 Actions 분이 무제한이므로 이 빈도를 무료로 돌릴 수 있다.
+    - cron: '*/10 * * * *'
   workflow_dispatch:        # Actions 탭에서 수동 실행 버튼
 
 permissions:
