@@ -1,6 +1,7 @@
 {
-  "channel": "lobotomycoperation",
-  "category": "공식정보",
+  "appid": 1973530,
+  "news_count": 20,
+  "language": "koreana",
   "webhook_username": "림버스 공지 알리미",
   "request_timeout_seconds": 15
 }
