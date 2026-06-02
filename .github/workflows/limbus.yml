@@ -32,14 +32,14 @@ jobs:
           LIMBUS_WEBHOOK_URL: ${{ secrets.LIMBUS_WEBHOOK_URL }}
         run: python limbus_watcher.py
 
-      - name: Commit updated limbus_seen.json
+      - name: Commit updated limbus_arca_seen.json
         run: |
-          if git diff --quiet limbus_seen.json 2>/dev/null; then
+          if git diff --quiet limbus_arca_seen.json 2>/dev/null; then
             echo "변경 없음 — 커밋 스킵"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add limbus_seen.json
-            git commit -m "chore: update limbus_seen.json"
+            git add limbus_arca_seen.json
+            git commit -m "chore: update limbus_arca_seen.json"
             git push
           fi
