@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout (PAT 인증 — 이래야 커밋이 활동으로 인정됨)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ secrets.KEEPALIVE_PAT }}
           fetch-depth: 0
