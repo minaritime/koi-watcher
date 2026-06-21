@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -168,6 +169,7 @@ def parse_notices(data: dict, config: dict) -> list[dict]:
             "id": gid,
             "title": title,
             "date": date_str,
+            "posttime": int(posttime) if posttime else 0,
             "url": url,
             "images": images,
             "video": video,
@@ -184,6 +186,82 @@ MAX_TEXT_LEN = 600                   # 텍스트 공지 본문 발췌 길이
 PER_FILE_CAP = 24 * 1024 * 1024      # 첨부 1개 최대 용량
 TOTAL_UPLOAD_CAP = 24 * 1024 * 1024  # 한 메시지 첨부 총합 최대 용량
 _UA = {"User-Agent": "Mozilla/5.0 (Limbus-Watcher)"}
+
+# 영상 공지 임베드 안정화 관련 상수.
+# 디스코드는 본문 링크를 "처음 받을 때 한 번만" 펼쳐 미리보기를 만들고 캐시한다.
+# 그래서 막 올라온(아직 디스코드가 플레이어를 못 만드는) 영상을 너무 일찍 보내면
+# "플레이어 없는 맨 링크" 상태로 굳어버린다(2026-06-19 사례). 아래 로직으로
+# 영상이 임베드 재생 가능한 상태가 된 뒤에 보낸다.
+YT_OEMBED = "https://www.youtube.com/oembed"
+MIN_VIDEO_AGE_SECONDS = 60        # 영상 공개 후 최소 이만큼 지난 뒤 전송(디스코드 settle 버퍼)
+IN_RUN_WAIT_SECONDS = 60          # 아직 준비 안 됐을 때 같은 실행 안에서 재확인 간격(약 1분)
+IN_RUN_MAX_ATTEMPTS = 3           # 같은 실행 안에서 재시도 횟수(초과 시 다음 cron 주기로 보류)
+MAX_DEFER_SECONDS = 6 * 3600      # 이 시간 넘게 준비 안 되면 누락 방지를 위해 그냥 전송
+
+_YT_ID = re.compile(r"(?:v=|youtu\.be/|/embed/)([\w-]{11})")
+_UPLOAD_DATE = re.compile(r'"uploadDate":"([^"]+)"')
+
+
+def _youtube_id(url: str | None) -> str | None:
+    m = _YT_ID.search(url or "")
+    return m.group(1) if m else None
+
+
+def video_embed_ready(video_url: str | None) -> bool:
+    """유튜브 영상이 '디스코드에서 임베드 재생 가능한' 상태인지 확인.
+
+    (1) oEmbed 200 = 공개/존재, (2) 본문에 playableInEmbed:true & status OK,
+    (3) 공개(uploadDate) 후 MIN_VIDEO_AGE_SECONDS 경과(막 올라온 영상 방지).
+    유튜브가 아니면(=검사 대상 아님) True. 네트워크/파싱 실패 시엔 보수적으로 False.
+    """
+    vid = _youtube_id(video_url)
+    if not vid:
+        return True
+    try:
+        watch_url = f"https://www.youtube.com/watch?v={vid}"
+        o = requests.get(
+            YT_OEMBED, params={"url": watch_url, "format": "json"},
+            headers=_UA, timeout=15,
+        )
+        if o.status_code != 200:
+            return False
+        w = requests.get(watch_url, headers=_UA, timeout=15)
+        page = w.text
+        if '"playableInEmbed":true' not in page or '"status":"OK"' not in page:
+            return False
+        m = _UPLOAD_DATE.search(page)
+        if m:
+            up = datetime.fromisoformat(m.group(1))
+            if (datetime.now(timezone.utc) - up).total_seconds() < MIN_VIDEO_AGE_SECONDS:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def wait_until_video_ready(notice: dict, log: logging.Logger) -> bool:
+    """영상 공지를 보내기 전, 임베드 준비가 될 때까지 같은 실행 안에서 잠깐 기다린다.
+
+    - 준비됨 → True (바로 전송)
+    - IN_RUN_MAX_ATTEMPTS 동안 약 1분 간격으로 재확인해도 안 되면 → False
+      (다음 cron 주기로 보류; 단 게시 후 MAX_DEFER_SECONDS 초과면 누락 방지로 True)
+    """
+    video = notice.get("video")
+    if not video:
+        return True
+    for attempt in range(IN_RUN_MAX_ATTEMPTS + 1):
+        if video_embed_ready(video):
+            return True
+        age = time.time() - (notice.get("posttime") or 0)
+        if age > MAX_DEFER_SECONDS:
+            log.warning("영상 준비 미확인이나 게시 후 %.1fh 경과 — 그냥 전송: %s",
+                        age / 3600, notice["title"])
+            return True
+        if attempt < IN_RUN_MAX_ATTEMPTS:
+            log.info("영상 임베드 준비 대기(%d/%d, %d초 후 재확인): %s",
+                     attempt + 1, IN_RUN_MAX_ATTEMPTS, IN_RUN_WAIT_SECONDS, notice["title"])
+            time.sleep(IN_RUN_WAIT_SECONDS)
+    return False
 
 
 def meta_embed(notice: dict) -> dict:
@@ -330,6 +408,11 @@ def main() -> int:
     log.info("새 공지 %d건 발견 — 디스코드 전송 시작", len(new_items))
     # API 는 최신순이므로 오래된 것부터 보내도록 reverse
     for notice in reversed(new_items):
+        # 영상 공지는 디스코드가 플레이어를 만들 수 있을 때까지 잠깐 기다린다.
+        # 아직이면 seen 에 안 넣고 건너뛰어 다음 cron 주기에서 재시도한다.
+        if notice.get("video") and not wait_until_video_ready(notice, log):
+            log.info("영상 아직 임베드 준비 안 됨 — 다음 주기로 보류: %s", notice["title"])
+            continue
         try:
             send_discord(
                 webhook_url,
