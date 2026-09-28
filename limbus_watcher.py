@@ -192,14 +192,16 @@ _UA = {"User-Agent": "Mozilla/5.0 (Limbus-Watcher)"}
 # 그래서 막 올라온(아직 디스코드가 플레이어를 못 만드는) 영상을 너무 일찍 보내면
 # "플레이어 없는 맨 링크" 상태로 굳어버린다(2026-06-19 사례). 아래 로직으로
 # 영상이 임베드 재생 가능한 상태가 된 뒤에 보낸다.
+# ⚠️ 유튜브 watch 페이지는 GitHub(데이터센터) IP 에서 정상 본문이 안 와서
+# 검사가 늘 실패 → 매번 MAX_DEFER(6h) 뒤에야 전송됐다(2026-09 확인).
+# 그래서 watch 페이지는 보지 않고 oEmbed + 스팀 게시 후 경과 시간만 본다.
 YT_OEMBED = "https://www.youtube.com/oembed"
-MIN_VIDEO_AGE_SECONDS = 60        # 영상 공개 후 최소 이만큼 지난 뒤 전송(디스코드 settle 버퍼)
+MIN_VIDEO_AGE_SECONDS = 120       # 스팀 게시 후 최소 이만큼 지난 뒤 전송(디스코드 settle 버퍼)
 IN_RUN_WAIT_SECONDS = 60          # 아직 준비 안 됐을 때 같은 실행 안에서 재확인 간격(약 1분)
 IN_RUN_MAX_ATTEMPTS = 3           # 같은 실행 안에서 재시도 횟수(초과 시 다음 cron 주기로 보류)
 MAX_DEFER_SECONDS = 6 * 3600      # 이 시간 넘게 준비 안 되면 누락 방지를 위해 그냥 전송
 
 _YT_ID = re.compile(r"(?:v=|youtu\.be/|/embed/)([\w-]{11})")
-_UPLOAD_DATE = re.compile(r'"uploadDate":"([^"]+)"')
 
 
 def _youtube_id(url: str | None) -> str | None:
@@ -207,35 +209,26 @@ def _youtube_id(url: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def video_embed_ready(video_url: str | None) -> bool:
+def video_embed_ready(video_url: str | None, posttime: int = 0) -> bool:
     """유튜브 영상이 '디스코드에서 임베드 재생 가능한' 상태인지 확인.
 
-    (1) oEmbed 200 = 공개/존재, (2) 본문에 playableInEmbed:true & status OK,
-    (3) 공개(uploadDate) 후 MIN_VIDEO_AGE_SECONDS 경과(막 올라온 영상 방지).
-    유튜브가 아니면(=검사 대상 아님) True. 네트워크/파싱 실패 시엔 보수적으로 False.
+    (1) 스팀 게시(posttime) 후 MIN_VIDEO_AGE_SECONDS 경과(막 올라온 영상 방지),
+    (2) oEmbed 200 = 공개/존재/임베드 허용.
+    유튜브가 아니면(=검사 대상 아님) True. 네트워크 실패 시엔 보수적으로 False.
     """
     vid = _youtube_id(video_url)
     if not vid:
         return True
+    if time.time() - (posttime or 0) < MIN_VIDEO_AGE_SECONDS:
+        return False
     try:
-        watch_url = f"https://www.youtube.com/watch?v={vid}"
         o = requests.get(
-            YT_OEMBED, params={"url": watch_url, "format": "json"},
+            YT_OEMBED,
+            params={"url": f"https://www.youtube.com/watch?v={vid}", "format": "json"},
             headers=_UA, timeout=15,
         )
-        if o.status_code != 200:
-            return False
-        w = requests.get(watch_url, headers=_UA, timeout=15)
-        page = w.text
-        if '"playableInEmbed":true' not in page or '"status":"OK"' not in page:
-            return False
-        m = _UPLOAD_DATE.search(page)
-        if m:
-            up = datetime.fromisoformat(m.group(1))
-            if (datetime.now(timezone.utc) - up).total_seconds() < MIN_VIDEO_AGE_SECONDS:
-                return False
-        return True
-    except Exception:
+        return o.status_code == 200
+    except requests.RequestException:
         return False
 
 
@@ -250,7 +243,7 @@ def wait_until_video_ready(notice: dict, log: logging.Logger) -> bool:
     if not video:
         return True
     for attempt in range(IN_RUN_MAX_ATTEMPTS + 1):
-        if video_embed_ready(video):
+        if video_embed_ready(video, notice.get("posttime") or 0):
             return True
         age = time.time() - (notice.get("posttime") or 0)
         if age > MAX_DEFER_SECONDS:
