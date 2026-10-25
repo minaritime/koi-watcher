@@ -1,7 +1,9 @@
 """KOI(한국정보올림피아드) 공지사항 모니터링 → 디스코드 알림.
 
-매 실행 시 https://koi.or.kr/notice 를 fetch 해서 이전에 보지 못한
-새 공지가 있으면 디스코드 웹훅으로 알림을 전송한다.
+매 실행 시 https://koi.or.kr/feed.xml (Atom 피드) 와 https://koi.or.kr/notice
+(공지 화면) 를 둘 다 읽어 합치고, 이전에 보지 못한 새 공지가 있으면
+디스코드 웹훅으로 알림을 전송한다. 연속 실패 시 실패 보고는 시간당 1회
+(fail_throttle.py).
 
 첫 실행 시에는 현재 보이는 모든 공지를 "이미 봤음" 상태로만 기록하고
 알림은 보내지 않는다 (스팸 방지).
@@ -13,17 +15,21 @@ import json
 import logging
 import os
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+from fail_throttle import run_throttled
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 SECRETS_PATH = SCRIPT_DIR / "secrets.json"
 SEEN_PATH = SCRIPT_DIR / "seen.json"
+FAIL_STATE_PATH = SCRIPT_DIR / "koi_fail_state.json"
 LOG_PATH = SCRIPT_DIR / "koi_watcher.log"
 
 
@@ -75,7 +81,14 @@ def save_seen(seen: set[str]) -> None:
         json.dump(sorted(seen), f, ensure_ascii=False, indent=2)
 
 
-def fetch_notices(url: str, timeout: int) -> list[dict]:
+ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
+
+# 2026-10-25 사이트 개편으로 칸 이름이 바뀜. 옛 이름도 남겨 되돌아가도 읽히게 한다.
+TITLE_SELECTOR = "td.subject a, td.title-cell a.u-url"
+DATE_SELECTOR = "td.num, td.date-cell"
+
+
+def _get(url: str, timeout: int) -> str:
     resp = requests.get(
         url,
         headers={"User-Agent": "Mozilla/5.0 (KOI-Watcher)"},
@@ -83,7 +96,62 @@ def fetch_notices(url: str, timeout: int) -> list[dict]:
     )
     resp.raise_for_status()
     resp.encoding = "utf-8"
-    return parse_notices(resp.text)
+    return resp.text
+
+
+def fetch_notices(config: dict, log: logging.Logger) -> list[dict]:
+    """피드와 공지 화면을 둘 다 읽어 합친다. 하나만 살아 있어도 동작한다.
+
+    피드가 갱신을 빼먹거나 화면 구조가 바뀌어도 다른 쪽이 받아 준다.
+    둘 다 0건이면 빈 목록을 돌려준다 (호출 쪽에서 실패 처리).
+    """
+    timeout = config.get("request_timeout_seconds", 15)
+    sources = [
+        ("피드", config.get("koi_feed_url"), parse_feed),
+        ("공지 화면", config["koi_notice_url"], parse_notices),
+    ]
+    merged: dict[str, dict] = {}
+    for name, url, parser in sources:
+        if not url:
+            continue
+        try:
+            items = parser(_get(url, timeout))
+        except Exception as e:
+            log.warning("%s 읽기 실패: %s", name, e)
+            continue
+        if not items:
+            log.warning("%s 에서 공지 0건 — 구조가 바뀌었을 수 있음", name)
+        log.info("%s: %d건", name, len(items))
+        for n in items:
+            merged.setdefault(n["id"], n)
+
+    # 최신순 (main 이 reverse 해서 오래된 것부터 보낸다)
+    return sorted(merged.values(), key=lambda n: n["date"], reverse=True)
+
+
+def _notice_path(href: str) -> str:
+    """피드는 전체 주소, 화면은 /notice/... 경로라 seen.json 기준(경로)으로 맞춘다."""
+    return urlparse(href).path or href
+
+
+def parse_feed(xml_text: str) -> list[dict]:
+    """Atom 피드(feed.xml)를 파싱해 [{id, title, date, href}, ...] 로 반환."""
+    root = ET.fromstring(xml_text)
+    notices: list[dict] = []
+    for entry in root.findall("atom:entry", ATOM_NS):
+        title = (entry.findtext("atom:title", "", ATOM_NS) or "").strip()
+        link = entry.find("atom:link", ATOM_NS)
+        href = _notice_path((link.get("href", "") if link is not None else "").strip())
+        updated = (entry.findtext("atom:updated", "", ATOM_NS) or "").strip()
+        if not href or not title or not href.startswith("/notice/"):
+            continue
+        notices.append({
+            "id": href,
+            "title": title,
+            "date": updated[:10],
+            "href": href,
+        })
+    return notices
 
 
 def parse_notices(html: str) -> list[dict]:
@@ -92,11 +160,11 @@ def parse_notices(html: str) -> list[dict]:
     notices: list[dict] = []
 
     for row in soup.select("tr"):
-        link = row.select_one("td.title-cell a.u-url")
-        date_cell = row.select_one("td.date-cell")
+        link = row.select_one(TITLE_SELECTOR)
+        date_cell = row.select_one(DATE_SELECTOR)
         if not link or not date_cell:
             continue
-        href = link.get("href", "").strip()
+        href = _notice_path(link.get("href", "").strip())
         title = link.get_text(strip=True)
         date = date_cell.get_text(strip=True)
         if not href or not title:
@@ -144,17 +212,9 @@ def main() -> int:
         log.error("설정 로드 실패: %s", e)
         return 2
 
-    try:
-        notices = fetch_notices(
-            config["koi_notice_url"],
-            timeout=config.get("request_timeout_seconds", 15),
-        )
-    except Exception as e:
-        log.error("KOI 페이지 fetch 실패: %s", e)
-        return 1
-
+    notices = fetch_notices(config, log)
     if not notices:
-        log.warning("공지가 0건 파싱됨 — 페이지 구조가 바뀌었을 수 있음")
+        log.error("피드와 공지 화면 모두에서 공지를 읽지 못함")
         return 1
 
     log.info("총 %d건 파싱됨", len(notices))
@@ -196,4 +256,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_throttled(main, FAIL_STATE_PATH, logging.getLogger("koi_watcher")))

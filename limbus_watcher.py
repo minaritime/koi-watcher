@@ -24,12 +24,15 @@ from pathlib import Path
 
 import requests
 
+from fail_throttle import run_throttled
+
 KST = timezone(timedelta(hours=9))
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_PATH = SCRIPT_DIR / "limbus_config.json"
 SECRETS_PATH = SCRIPT_DIR / "secrets.json"
 SEEN_PATH = SCRIPT_DIR / "limbus_seen.json"
+FAIL_STATE_PATH = SCRIPT_DIR / "limbus_fail_state.json"
 LOG_PATH = SCRIPT_DIR / "limbus_watcher.log"
 
 # 스팀 스토어 이벤트 API. l=koreana 로 한국어 공지를 받을 수 있다.
@@ -423,4 +426,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_throttled(main, FAIL_STATE_PATH, logging.getLogger("limbus_watcher")))
