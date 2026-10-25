@@ -36,12 +36,12 @@ jobs:
         # 실행이 실패해도 실패 상태 파일(limbus_fail_state.json)은 커밋해야 메일 간격 제한이 동작한다
         if: ${{ !cancelled() }}
         run: |
-          if git diff --quiet -- limbus_seen.json limbus_fail_state.json 2>/dev/null; then
+          if git diff --quiet -- limbus_seen.json limbus_fail_state.json limbus_x_seen.json limbus_x_state.json 2>/dev/null; then
             echo "변경 없음 — 커밋 스킵"
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add limbus_seen.json limbus_fail_state.json
+            git add limbus_seen.json limbus_fail_state.json limbus_x_seen.json limbus_x_state.json
             git commit -m "chore: update limbus_seen.json"
             git pull --rebase -q
             git push

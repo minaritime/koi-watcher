@@ -3,5 +3,10 @@
   "news_count": 20,
   "language": "koreana",
   "webhook_username": "림버스 공지 알리미",
-  "request_timeout_seconds": 15
+  "request_timeout_seconds": 15,
+  "x_handle": "LimbusCompany_B",
+  "x_nitter_instances": [
+    "https://nitter.kareem.one"
+  ],
+  "x_alert_mention_user_id": ""
 }

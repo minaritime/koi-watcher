@@ -25,6 +25,7 @@ from pathlib import Path
 import requests
 
 from fail_throttle import run_throttled
+from limbus_x import process_x
 
 KST = timezone(timedelta(hours=9))
 
@@ -267,7 +268,7 @@ def meta_embed(notice: dict) -> dict:
         "url": notice["url"],
         "color": EMBED_COLOR,
         "fields": [{"name": "게시일", "value": notice["date"], "inline": True}],
-        "footer": {"text": "Limbus Company · Steam 공지"},
+        "footer": {"text": notice.get("source_label", "Limbus Company · Steam 공지")},
     }
 
 
@@ -316,12 +317,12 @@ def build_payload(username: str, notice: dict) -> dict:
             if i == 0:
                 embed.update(meta_embed(notice))
             embeds.append(embed)
-        return {**base, "content": CONTENT_HEADER, "embeds": embeds}
+        return {**base, "content": notice.get("header", CONTENT_HEADER), "embeds": embeds}
 
     if video:
         return {
             **base,
-            "content": f"{CONTENT_HEADER}\n**{notice['title']}**  "
+            "content": f"{notice.get('header', CONTENT_HEADER)}\n**{notice['title']}**  "
                        f"(게시일 {notice['date']})\n{notice['video']}",
         }
 
@@ -329,7 +330,7 @@ def build_payload(username: str, notice: dict) -> dict:
     desc = text[:MAX_TEXT_LEN] + ("…" if len(text) > MAX_TEXT_LEN else "")
     embed = meta_embed(notice)
     embed["description"] = desc or "(본문 없음)"
-    return {**base, "content": CONTENT_HEADER, "embeds": [embed]}
+    return {**base, "content": notice.get("header", CONTENT_HEADER), "embeds": [embed]}
 
 
 def send_discord(webhook_url: str, username: str, notice: dict) -> None:
@@ -343,7 +344,7 @@ def send_discord(webhook_url: str, username: str, notice: dict) -> None:
             payload = {
                 "username": username,
                 "allowed_mentions": {"parse": ["everyone"]},
-                "content": CONTENT_HEADER,
+                "content": notice.get("header", CONTENT_HEADER),
                 "embeds": [meta_embed(notice)],
             }
             try:
@@ -385,7 +386,20 @@ def main() -> int:
         return 1
 
     log.info("총 %d건 파싱됨", len(notices))
+    username = config.get("webhook_username", "림버스 공지 알리미")
 
+    process_steam(notices, webhook_url, username, log)
+
+    # 스팀에 없는 X 소식 (덤). 실패해도 종료 코드에 영향 없음 → 끊김은 디스코드로 알림
+    if config.get("x_handle"):
+        process_x(config, webhook_url, notices,
+                  lambda n: send_discord(webhook_url, username, n), log)
+
+    return 0
+
+
+def process_steam(notices: list[dict], webhook_url: str, username: str,
+                  log: logging.Logger) -> None:
     seen = load_seen()
     first_run = not SEEN_PATH.exists()
 
@@ -394,12 +408,12 @@ def main() -> int:
             seen.add(n["id"])
         save_seen(seen)
         log.info("첫 실행: %d건을 baseline 으로 기록 (알림 미발송)", len(notices))
-        return 0
+        return
 
     new_items = [n for n in notices if n["id"] not in seen]
     if not new_items:
         log.info("새 공지 없음")
-        return 0
+        return
 
     log.info("새 공지 %d건 발견 — 디스코드 전송 시작", len(new_items))
     # API 는 최신순이므로 오래된 것부터 보내도록 reverse
@@ -410,19 +424,13 @@ def main() -> int:
             log.info("영상 아직 임베드 준비 안 됨 — 다음 주기로 보류: %s", notice["title"])
             continue
         try:
-            send_discord(
-                webhook_url,
-                config.get("webhook_username", "림버스 공지 알리미"),
-                notice,
-            )
+            send_discord(webhook_url, username, notice)
             seen.add(notice["id"])
             save_seen(seen)
             log.info("전송 완료: %s", notice["title"])
         except Exception as e:
             log.error("전송 실패 (%s): %s", notice["title"], e)
             # 실패 시 seen 에 추가하지 않음 → 다음 실행에서 재시도
-
-    return 0
 
 
 if __name__ == "__main__":
