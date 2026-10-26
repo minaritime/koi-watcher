@@ -9,8 +9,8 @@
 - 거르기: 리트윗(음원·콘서트·굿즈 대부분)과 답글은 빼고, 비게임 키워드도 뺀다.
   제목이 같은 스팀 공지가 있으면 뺀다 (겹치는 공지는 늘 스팀이 먼저 올라옴).
   기준점(limbus_x_seen.json 의 since) 이전 글은 절대 보내지 않는다.
-- 끊김: 두 곳 다 실패하면 바로 디스코드에 알림(@everyone 없이 지정한 사람만
-  멘션), 다시 연결되면 복구 알림. X 실패는 워크플로우 실패(메일)로 치지 않는다.
+- 끊김: 두 곳 다 실패해도 디스코드 알림 없이 로그 경고만 남긴다 (2026-10-26,
+  끊김·복구가 오락가락해 채널이 지저분해져 끔). X 실패는 워크플로우 실패(메일)로 치지 않는다.
 """
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ import requests
 KST = timezone(timedelta(hours=9))
 SCRIPT_DIR = Path(__file__).parent
 X_SEEN_PATH = SCRIPT_DIR / "limbus_x_seen.json"
-X_STATE_PATH = SCRIPT_DIR / "limbus_x_state.json"
 
 FXTWITTER_API = "https://api.fxtwitter.com/2/profile/{handle}/statuses"
 FETCH_ATTEMPTS = 3            # Nitter 는 503 이 잦아 한 실행 안에서 몇 번 더 시도
@@ -246,40 +245,12 @@ def _save_json(path: Path, data) -> None:
         f.write("\n")
 
 
-# ---------- 끊김 알림 ----------
+# ---------- 끊김 기록 ----------
 
-def _alert(webhook_url: str, config: dict, message: str) -> None:
-    uid = str(config.get("x_alert_mention_user_id") or "").strip()
-    payload = {
-        "username": config.get("webhook_username", "림버스 공지 알리미"),
-        "content": (f"<@{uid}> " if uid else "") + message,
-        "allowed_mentions": {"parse": [], "users": [uid] if uid else []},
-    }
-    resp = requests.post(webhook_url, json=payload, timeout=30)
-    resp.raise_for_status()
-
-
-def update_link_state(ok: bool, webhook_url: str, config: dict, log: logging.Logger) -> None:
-    """두 경로 다 실패하면 끊김 알림 1번, 회복하면 복구 알림 1번."""
-    state = _load_json(X_STATE_PATH, {})
-    now = int(time.time())
-    try:
-        if not ok and not state.get("alerted"):
-            _alert(webhook_url, config,
-                   "⚠️ 림버스 X 소식 연결이 끊겼습니다. fxtwitter와 Nitter 모두 응답이 없어서 "
-                   "인격 예고 같은 X 소식을 받을 수 없습니다. 스팀 공지는 계속 옵니다. "
-                   "다시 연결되면 알려 드립니다.")
-            _save_json(X_STATE_PATH, {"down_since": state.get("down_since") or now, "alerted": True})
-            log.warning("X 끊김 알림 전송")
-        elif ok and state.get("alerted"):
-            mins = (now - state.get("down_since", now)) // 60
-            _alert(webhook_url, config,
-                   f"✅ 림버스 X 소식 연결이 복구되었습니다. (끊겨 있던 시간: 약 {mins // 60}시간 {mins % 60}분) "
-                   "그사이 올라온 소식이 있으면 이어서 보냅니다.")
-            _save_json(X_STATE_PATH, {})
-            log.info("X 복구 알림 전송")
-    except Exception as e:
-        log.error("X 끊김/복구 알림 전송 실패 (다음 실행에서 재시도): %s", e)
+def update_link_state(ok: bool, log: logging.Logger) -> None:
+    """끊김/복구는 디스코드로 알리지 않고 로그에만 남긴다 (자주 오락가락해 채널이 지저분해짐)."""
+    if not ok:
+        log.warning("X 두 경로(fxtwitter, Nitter) 모두 응답 없음")
 
 
 # ---------- 진입점 ----------
@@ -310,7 +281,7 @@ def process_x(config: dict, webhook_url: str, steam_notices: list[dict],
 def _process_x(config: dict, webhook_url: str, steam_notices: list[dict],
                send: Callable[[dict], None], log: logging.Logger) -> None:
     tweets = fetch_tweets(config, log)
-    update_link_state(bool(tweets), webhook_url, config, log)
+    update_link_state(bool(tweets), log)
     if not tweets:
         return
 
