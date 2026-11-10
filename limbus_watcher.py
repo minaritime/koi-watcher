@@ -185,7 +185,7 @@ def parse_notices(data: dict, config: dict) -> list[dict]:
 
 CONTENT_HEADER = "@everyone 📢 림버스 컴퍼니 새 공지가 올라왔습니다"
 EMBED_COLOR = 0xC0392B
-MAX_IMAGES = 10                      # 한 메시지에 보여줄 이미지 최대 개수 (디스코드 첨부 한도 = 10)
+MAX_IMAGES = 10                      # 메시지 1개에 넣는 이미지 수 (디스코드 첨부 한도 = 10). 넘으면 이어서 보냄
 MAX_TEXT_LEN = 600                   # 텍스트 공지 본문 발췌 길이
 PER_FILE_CAP = 24 * 1024 * 1024      # 첨부 1개 최대 용량
 TOTAL_UPLOAD_CAP = 24 * 1024 * 1024  # 한 메시지 첨부 총합 최대 용량
@@ -272,16 +272,16 @@ def meta_embed(notice: dict) -> dict:
     }
 
 
-def download_images(urls: list[str]) -> list[tuple]:
-    """이미지를 내려받아 (파일명, bytes, mime) 목록으로 반환.
+def download_images(urls: list[str], start_index: int = 0) -> list[tuple]:
+    """이미지를 내려받아 (파일명, bytes, mime) 목록으로 반환. 메시지 1개 분량(최대 10장)씩 부른다.
 
     이미지를 "전부" 보여주는 것이 목표라, 한 장이라도 못 받거나 용량 한도를 넘으면
-    일부만 첨부해 누락시키지 않고 빈 목록을 반환한다. 그러면 send_discord 가
+    일부만 첨부해 누락시키지 않고 빈 목록을 반환한다. 그러면 호출한 쪽이
     URL 임베드 방식으로 폴백해 (용량 제한 없이) 모든 이미지를 표시한다.
     """
     files: list[tuple] = []
     total = 0
-    for i, u in enumerate(urls[:MAX_IMAGES]):
+    for i, u in enumerate(urls, start=start_index):
         try:
             r = requests.get(u, headers=_UA, timeout=30)
             r.raise_for_status()
@@ -299,25 +299,89 @@ def download_images(urls: list[str]) -> list[tuple]:
     return files
 
 
-def build_payload(username: str, notice: dict) -> dict:
-    """JSON 전용 페이로드 (영상/텍스트, 그리고 이미지 첨부 실패 시 임베드 URL 폴백).
+def image_chunks(images: list[str]) -> list[list[str]]:
+    """이미지를 메시지 하나에 들어가는 MAX_IMAGES 장씩 나눈다 (11장이면 10 + 1)."""
+    return [images[i:i + MAX_IMAGES] for i in range(0, len(images), MAX_IMAGES)]
 
-    - 이미지: 이미지 URL 을 임베드로 표시 (여러 장은 같은 url 공유로 갤러리). 첨부 실패 폴백용.
+
+def image_message_base(username: str, notice: dict, is_first: bool) -> dict:
+    """이미지 메시지 공통 부분. 첫 메시지만 @everyone + 제목 카드, 이어지는 메시지는 핑 없이 이미지만."""
+    if is_first:
+        return {
+            "username": username,
+            "allowed_mentions": {"parse": ["everyone"]},
+            "content": notice.get("header", CONTENT_HEADER),
+        }
+    return {"username": username, "allowed_mentions": {"parse": []}}
+
+
+def image_embed_payload(username: str, notice: dict, urls: list[str], is_first: bool) -> dict:
+    """첨부 실패 시 폴백: 이미지 URL 을 임베드로 표시 (같은 url 공유로 갤러리)."""
+    embeds = []
+    for i, img in enumerate(urls):
+        embed = {"url": notice["url"], "image": {"url": img}, "color": EMBED_COLOR}
+        if i == 0 and is_first:
+            embed.update(meta_embed(notice))
+        embeds.append(embed)
+    return {**image_message_base(username, notice, is_first), "embeds": embeds}
+
+
+def send_image_chunk(webhook_url: str, username: str, notice: dict,
+                     urls: list[str], start_index: int, is_first: bool) -> None:
+    """이미지 메시지 1개 전송. 원본 파일 첨부를 먼저 시도하고, 안 되면 임베드 URL 로 폴백.
+
+    원본 이미지를 파일로 첨부해야 확대 시 글자가 선명하다.
+    (임베드 URL 방식은 디스코드 프록시가 압축·축소해서 흐릿함)
+    """
+    log = logging.getLogger("limbus_watcher")
+    files = download_images(urls, start_index)
+    if files:
+        payload = image_message_base(username, notice, is_first)
+        if is_first:
+            payload = {**payload, "embeds": [meta_embed(notice)]}
+        try:
+            resp = requests.post(
+                webhook_url,
+                data={"payload_json": json.dumps(payload)},
+                files={f"file{i}": f for i, f in enumerate(files)},
+                timeout=90,
+            )
+            resp.raise_for_status()
+            return
+        except Exception as e:
+            log.warning("이미지 첨부 실패 → 임베드 URL 로 폴백: %s", e)
+
+    resp = requests.post(webhook_url, json=image_embed_payload(username, notice, urls, is_first),
+                         timeout=30)
+    resp.raise_for_status()
+
+
+def send_images(webhook_url: str, username: str, notice: dict) -> None:
+    """이미지 공지 전송. 10장이 넘으면 10장씩 나눠 이어서 보낸다.
+
+    첫 메시지가 실패하면 예외를 그대로 올려 다음 실행에서 공지 전체를 재시도한다.
+    첫 메시지가 간 뒤 이어지는 메시지가 실패하면 로그만 남긴다
+    (다시 보내면 @everyone 이 두 번 울리므로).
+    """
+    log = logging.getLogger("limbus_watcher")
+    chunks = image_chunks(notice["images"])
+    send_image_chunk(webhook_url, username, notice, chunks[0], 0, is_first=True)
+    for n, chunk in enumerate(chunks[1:], start=1):
+        try:
+            send_image_chunk(webhook_url, username, notice, chunk, n * MAX_IMAGES, is_first=False)
+        except Exception as e:
+            log.error("이어지는 이미지 %d~%d장 전송 실패 (%s): %s",
+                      n * MAX_IMAGES + 1, n * MAX_IMAGES + len(chunk), notice["title"], e)
+
+
+def build_payload(username: str, notice: dict) -> dict:
+    """영상·텍스트 공지용 JSON 페이로드 (이미지 공지는 send_images 가 따로 처리).
+
     - 영상: 유튜브 URL 을 content 에 넣어 디스코드 재생 카드로 표시
     - 텍스트: 제목 + 본문 발췌
     """
-    images = notice.get("images") or []
     video = notice.get("video")
     base = {"username": username, "allowed_mentions": {"parse": ["everyone"]}}
-
-    if images:
-        embeds = []
-        for i, img in enumerate(images[:MAX_IMAGES]):
-            embed = {"url": notice["url"], "image": {"url": img}, "color": EMBED_COLOR}
-            if i == 0:
-                embed.update(meta_embed(notice))
-            embeds.append(embed)
-        return {**base, "content": notice.get("header", CONTENT_HEADER), "embeds": embeds}
 
     if video:
         return {
@@ -334,32 +398,11 @@ def build_payload(username: str, notice: dict) -> dict:
 
 
 def send_discord(webhook_url: str, username: str, notice: dict) -> None:
-    log = logging.getLogger("limbus_watcher")
-
     if notice.get("images"):
-        # 원본 이미지를 파일로 첨부해야 확대 시 글자가 선명하다.
-        # (임베드 URL 방식은 디스코드 프록시가 압축·축소해서 흐릿함)
-        files = download_images(notice["images"])
-        if files:
-            payload = {
-                "username": username,
-                "allowed_mentions": {"parse": ["everyone"]},
-                "content": notice.get("header", CONTENT_HEADER),
-                "embeds": [meta_embed(notice)],
-            }
-            try:
-                resp = requests.post(
-                    webhook_url,
-                    data={"payload_json": json.dumps(payload)},
-                    files={f"file{i}": f for i, f in enumerate(files)},
-                    timeout=90,
-                )
-                resp.raise_for_status()
-                return
-            except Exception as e:
-                log.warning("이미지 첨부 실패 → 임베드 URL 로 폴백: %s", e)
+        send_images(webhook_url, username, notice)
+        return
 
-    # 영상·텍스트, 또는 이미지 첨부 실패 시 폴백
+    # 영상·텍스트 공지
     resp = requests.post(webhook_url, json=build_payload(username, notice), timeout=30)
     resp.raise_for_status()
 
